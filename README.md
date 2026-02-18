@@ -28,17 +28,19 @@ Search is powered by a **FTS5 full-text index** with porter stemming — initial
 
 ### Claude Code
 
-Add to `~/.claude/mcp.json` (create if it doesn't exist):
+Run:
+
+```bash
+claude mcp add imessage -- uv run --with fastmcp fastmcp run /ABSOLUTE/PATH/TO/imessage-mcp/server.py
+```
+
+Or manually add to the `mcpServers` object in `~/.claude.json`:
 
 ```json
-{
-  "mcpServers": {
-    "imessage": {
-      "command": "uv",
-      "args": ["run", "--with", "fastmcp", "fastmcp", "run",
-               "/ABSOLUTE/PATH/TO/imessage-mcp/server.py"]
-    }
-  }
+"imessage": {
+  "command": "uv",
+  "args": ["run", "--with", "fastmcp", "fastmcp", "run",
+           "/ABSOLUTE/PATH/TO/imessage-mcp/server.py"]
 }
 ```
 
