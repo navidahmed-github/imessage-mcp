@@ -54,7 +54,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "imessage": {
-      "command": "uv",
+      "command": "/ABSOLUTE/PATH/TO/uv",
       "args": ["run", "--with", "fastmcp", "fastmcp", "run",
                "/ABSOLUTE/PATH/TO/imessage-mcp/server.py"]
     }
@@ -64,7 +64,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 Then restart Claude Desktop.
 
-> Replace `/ABSOLUTE/PATH/TO/imessage-mcp/server.py` with the actual path where you cloned this repo.
+> **Important:** Claude Desktop has a limited PATH, so you must use the **full path to `uv`** (run `which uv` to find it). Replace both absolute paths with your actual paths.
 
 ## How it works
 
