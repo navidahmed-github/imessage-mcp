@@ -1,4 +1,4 @@
-data/
+launchd.log
+*.bak
 __pycache__/
-*.pyc
-WRAPPED.md
+.venv/

@@ -100,46 +100,117 @@ def parse_date(s: str) -> int | None:
 # attributedBody decoder
 # ---------------------------------------------------------------------------
 
-def decode_attributed_body(blob: bytes) -> str | None:
-    """Extract plain text from an NSAttributedString binary BLOB.
+def _read_ts_length(blob: bytes, pos: int):
+    """Read a typedstream length at pos. Returns (length, next_pos) or None."""
+    if pos >= len(blob):
+        return None
+    b = blob[pos]
+    if b < 0x80:
+        return b, pos + 1
+    if b == 0x81 and pos + 3 <= len(blob):
+        return int.from_bytes(blob[pos + 1:pos + 3], "little"), pos + 3
+    if b == 0x82 and pos + 5 <= len(blob):
+        return int.from_bytes(blob[pos + 1:pos + 5], "little"), pos + 5
+    return None
 
-    The typical layout has a marker \\x01+ followed by a length byte,
-    then the UTF-8 text content.
+
+def decode_attributed_body(blob: bytes) -> str | None:
+    """Extract plain text from an NSAttributedString typedstream BLOB.
+
+    Layout: ... NSString ... \x01+ <length> <utf-8 text> ...
+    <length> is one byte if < 0x80, else 0x81 + uint16 LE, or 0x82 + uint32 LE.
     """
     if not blob:
         return None
     try:
-        # Primary method: find the \x01\x2b marker
         marker = b"\x01\x2b"
         idx = blob.find(marker)
-        if idx != -1:
-            start = idx + len(marker)
-            if start < len(blob):
-                length = blob[start]
-                text_start = start + 1
-                # If length byte is large enough, it might be a multi-byte length
-                if length == 0 and text_start + 1 < len(blob):
-                    return None
-                text = blob[text_start:text_start + length].decode("utf-8", errors="replace")
-                if text.strip():
-                    return text.strip()
-
-        # Fallback: look for \x01+ patterns with larger length encoding
-        for m in re.finditer(rb"\x01(.)", blob):
-            pos = m.end()
-            length = m.group(1)[0]
-            if 5 < length < 250 and pos + length <= len(blob):
-                try:
-                    candidate = blob[pos:pos + length].decode("utf-8", errors="strict")
-                    # Heuristic: must contain some letter characters
-                    if any(c.isalpha() for c in candidate) and candidate.strip():
-                        return candidate.strip()
-                except UnicodeDecodeError:
-                    continue
-
+        while idx != -1:
+            res = _read_ts_length(blob, idx + len(marker))
+            if res:
+                length, start = res
+                if 0 < length <= len(blob) - start:
+                    text = blob[start:start + length].decode("utf-8", errors="replace")
+                    if text.strip():
+                        return text.strip()
+            idx = blob.find(marker, idx + 1)
         return None
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Contact name resolution (reads macOS Contacts DB directly, cached)
+# ---------------------------------------------------------------------------
+
+_CONTACT_CACHE: dict[str, str] | None = None
+_CONTACT_CACHE_TS: float = 0.0
+
+
+def _norm_handle(h: str) -> str:
+    """Normalize a phone/email handle for matching."""
+    if not h:
+        return ""
+    h = h.strip().lower()
+    if "@" in h:
+        return h
+    digits = re.sub(r"[^0-9]", "", h)
+    # Compare on last 9 digits so +61 4xx and 04xx match
+    return digits[-9:] if len(digits) >= 9 else digits
+
+
+def _load_contacts() -> dict[str, str]:
+    global _CONTACT_CACHE, _CONTACT_CACHE_TS
+    if _CONTACT_CACHE is not None and time.time() - _CONTACT_CACHE_TS < 600:
+        return _CONTACT_CACHE
+    mapping: dict[str, str] = {}
+    base = Path.home() / "Library" / "Application Support" / "AddressBook"
+    dbs = list(base.glob("Sources/*/AddressBook-v22.abcddb")) + [base / "AddressBook-v22.abcddb"]
+    for db in dbs:
+        if not db.exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT r.Z_PK, r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION,
+                       p.ZFULLNUMBER as phone, NULL as email
+                FROM ZABCDRECORD r
+                JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
+                UNION ALL
+                SELECT r.Z_PK, r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION,
+                       NULL as phone, e.ZADDRESS as email
+                FROM ZABCDRECORD r
+                JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
+            """).fetchall()
+            conn.close()
+            for r in rows:
+                name = " ".join(x for x in [r["ZFIRSTNAME"], r["ZLASTNAME"]] if x).strip() or (r["ZORGANIZATION"] or "")
+                if not name:
+                    continue
+                key = _norm_handle(r["phone"] or r["email"] or "")
+                if key and key not in mapping:
+                    mapping[key] = name
+        except Exception:
+            continue
+    _CONTACT_CACHE = mapping
+    _CONTACT_CACHE_TS = time.time()
+    return mapping
+
+
+def contact_name(handle: str | None) -> str | None:
+    """Return the Contacts name for a phone/email handle, or None."""
+    if not handle:
+        return None
+    return _load_contacts().get(_norm_handle(handle))
+
+
+def label_handle(handle: str | None) -> str:
+    """'Name (handle)' if known, else the raw handle."""
+    if not handle:
+        return "unknown"
+    name = contact_name(handle)
+    return f"{name} ({handle})" if name else handle
 
 # ---------------------------------------------------------------------------
 # Phone normalization
@@ -185,7 +256,7 @@ def resolve_chat(db: sqlite3.Connection, identifier: str) -> tuple[int, str] | N
         (identifier,),
     ).fetchone()
     if row:
-        label = row["display_name"] or row["chat_identifier"]
+        label = row["display_name"] or label_handle(row["chat_identifier"])
         return row["ROWID"], label
 
     # Try display_name (group chats)
@@ -203,7 +274,7 @@ def resolve_chat(db: sqlite3.Connection, identifier: str) -> tuple[int, str] | N
             (int(identifier),),
         ).fetchone()
         if row:
-            label = row["display_name"] or row["chat_identifier"]
+            label = row["display_name"] or label_handle(row["chat_identifier"])
             return row["ROWID"], label
 
     # Try phone number variants
@@ -213,7 +284,7 @@ def resolve_chat(db: sqlite3.Connection, identifier: str) -> tuple[int, str] | N
             (variant,),
         ).fetchone()
         if row:
-            label = row["display_name"] or row["chat_identifier"]
+            label = row["display_name"] or label_handle(row["chat_identifier"])
             return row["ROWID"], label
 
     # Try email
@@ -223,7 +294,7 @@ def resolve_chat(db: sqlite3.Connection, identifier: str) -> tuple[int, str] | N
             (identifier,),
         ).fetchone()
         if row:
-            label = row["display_name"] or row["chat_identifier"]
+            label = row["display_name"] or label_handle(row["chat_identifier"])
             return row["ROWID"], label
 
     return None
@@ -334,7 +405,7 @@ def _format_message(row, cdb: sqlite3.Connection) -> str:
     date_ts = apple_ns_to_unix(row["date"]) if row["date"] else 0
     ts = format_ts(date_ts)
     direction = "→" if row["is_from_me"] else "←"
-    sender = "me" if row["is_from_me"] else (row["handle_id"] or "unknown")
+    sender = "me" if row["is_from_me"] else label_handle(row["handle_id"])
 
     parts = [f"[{ts}] {direction} {sender}: {text}"]
 
@@ -566,11 +637,21 @@ def list_conversations(limit: int = 30, sort_by: str = "recent") -> str:
                c.style,
                COUNT(cmj.message_id) as msg_count,
                MAX(m.date) as last_date,
-               (SELECT COALESCE(m2.text, '[media]')
+               (SELECT m2.text
                 FROM message m2
                 INNER JOIN chat_message_join cmj2 ON cmj2.message_id = m2.ROWID
                 WHERE cmj2.chat_id = c.ROWID AND m2.associated_message_type = 0
-                ORDER BY m2.date DESC LIMIT 1) as last_text
+                ORDER BY m2.date DESC LIMIT 1) as last_text,
+               (SELECT m3.attributedBody
+                FROM message m3
+                INNER JOIN chat_message_join cmj3 ON cmj3.message_id = m3.ROWID
+                WHERE cmj3.chat_id = c.ROWID
+                ORDER BY m3.date DESC LIMIT 1) as last_blob,
+               (SELECT m4.cache_has_attachments
+                FROM message m4
+                INNER JOIN chat_message_join cmj4 ON cmj4.message_id = m4.ROWID
+                WHERE cmj4.chat_id = c.ROWID
+                ORDER BY m4.date DESC LIMIT 1) as last_has_att
         FROM chat c
         LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
         LEFT JOIN message m ON m.ROWID = cmj.message_id
@@ -582,12 +663,15 @@ def list_conversations(limit: int = 30, sort_by: str = "recent") -> str:
 
     lines = []
     for r in rows:
-        name = r["display_name"] or r["chat_identifier"]
         is_group = r["style"] == 43
+        name = r["display_name"] or (r["chat_identifier"] if is_group else label_handle(r["chat_identifier"]))
         kind = "group" if is_group else "DM"
         service = r["service_name"] or ""
         last_date = format_ts(apple_ns_to_unix(r["last_date"])) if r["last_date"] else "?"
-        preview = (r["last_text"] or "")[:80]
+        preview_text = r["last_text"] or (decode_attributed_body(r["last_blob"]) if r["last_blob"] else None)
+        if not preview_text:
+            preview_text = "[attachment]" if r["last_has_att"] else "[empty]"
+        preview = preview_text.replace("\n", " ")[:80]
 
         # Get participants for group chats
         participants = ""
@@ -598,7 +682,7 @@ def list_conversations(limit: int = 30, sort_by: str = "recent") -> str:
                 WHERE chj.chat_id = ?
             """, (r["chat_id"],)).fetchall()
             if handles:
-                participants = f"\n  participants: {', '.join(h['id'] for h in handles)}"
+                participants = f"\n  participants: {', '.join(label_handle(h['id']) for h in handles)}"
 
         lines.append(
             f"[{r['chat_id']}] {name} ({kind}, {service}, {r['msg_count']} msgs)\n"
@@ -695,7 +779,7 @@ def get_unread_messages(limit: int = 50) -> str:
         cid = r["chat_id"]
         if cid not in chats:
             chats[cid] = []
-            chat_labels[cid] = r["display_name"] or r["chat_identifier"]
+            chat_labels[cid] = r["display_name"] or label_handle(r["chat_identifier"])
         chats[cid].append(r)
 
     parts = [f"{len(rows)} unread messages in {len(chats)} conversations:\n"]
